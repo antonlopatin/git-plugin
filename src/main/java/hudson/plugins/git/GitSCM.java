@@ -34,15 +34,13 @@ import org.kohsuke.stapler.StaplerResponse;
 import org.kohsuke.stapler.export.Exported;
 
 import javax.servlet.ServletException;
-import java.io.File;
-import java.io.IOException;
-import java.io.PrintStream;
-import java.io.Serializable;
+import java.io.*;
 import java.net.MalformedURLException;
 import java.text.MessageFormat;
 import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static hudson.Util.fixEmptyAndTrim;
@@ -92,6 +90,7 @@ public class GitSCM extends SCM implements Serializable {
     private boolean disableSubmodules;
     private boolean recursiveSubmodules;
     private boolean doGenerateSubmoduleConfigurations;
+    private int submoduleChangesRecursionDepth;
     private boolean authorOrCommitter;
     private boolean clean;
     private boolean wipeOutWorkspace;
@@ -151,7 +150,7 @@ public class GitSCM extends SCM implements Serializable {
                 false, Collections.<SubmoduleConfig>emptyList(), false,
                 false, new DefaultBuildChooser(), null, null, false, null,
                 null,
-                null, null, null, false, false, false, false, null, null, false, null, false, false);
+                null, null, null, false, false, false, false, null, null, false, null, false, false, 0);
     }
 
     @DataBoundConstructor
@@ -181,7 +180,8 @@ public class GitSCM extends SCM implements Serializable {
             boolean skipTag,
             String includedRegions,
             boolean ignoreNotifyCommit,
-            boolean useShallowClone) {
+            boolean useShallowClone,
+            int submoduleChangesRecursionDepth) {
 
         this.scmName = scmName;
 
@@ -248,6 +248,8 @@ public class GitSCM extends SCM implements Serializable {
         this.skipTag = skipTag;
         this.includedRegions = includedRegions;
         buildChooser.gitSCM = this; // set the owner
+
+        this.submoduleChangesRecursionDepth = submoduleChangesRecursionDepth > 0 ? submoduleChangesRecursionDepth : 0;
     }
 
     private void updateFromUserData() throws GitException {
@@ -501,7 +503,7 @@ public class GitSCM extends SCM implements Serializable {
     public boolean isIgnoreNotifyCommit() {
         return ignoreNotifyCommit;
     }
-    
+
     public boolean getUseShallowClone() {
     	return useShallowClone;
     }
@@ -693,7 +695,7 @@ public class GitSCM extends SCM implements Serializable {
         // I'm actually not 100% sure about this, but I'll leave it in for now.
         // Update 9/9/2010 - actually, I think this *was* needed, since we weren't doing a better check
         // for whether we'd ever been built before. But I'm fixing that right now anyway.
-        
+
         // JENKINS-10880: workingDirectory can be null
         if (workingDirectory == null || !workingDirectory.exists()) {
             return PollingResult.BUILD_NOW;
@@ -1004,7 +1006,7 @@ public class GitSCM extends SCM implements Serializable {
                 } else {
 
                     log.println("Cloning the remote Git repository");
-                    
+
                     // Go through the repositories, trying to clone from one
                     //
                     boolean successfullyCloned = false;
@@ -1085,7 +1087,7 @@ public class GitSCM extends SCM implements Serializable {
             throws IOException, InterruptedException {
 
         final EnvVars environment = build.getEnvironment(listener);
-        
+
         final FilePath changelogFile = new FilePath(_changelogFile);
 
         listener.getLogger().println("Checkout:" + workspace.getName() + " / " + workspace.getRemote() + " - " + workspace.getChannel());
@@ -1292,7 +1294,7 @@ public class GitSCM extends SCM implements Serializable {
                 Build lastRevWas = buildChooser.prevBuildForChangelog(b.getName(), buildData, git, context);
                 if (lastRevWas != null) {
                     if (git.isCommitInRepo(lastRevWas.getSHA1())) {
-                        putChangelogDiffs(git, b.getName(), lastRevWas.getSHA1().name(), revToBuild.getSha1().name(), out);
+                        putChangelogDiffs(git, b.getName(), lastRevWas.getSHA1().name(), revToBuild.getSha1().name(), out, 0);
                         histories++;
                     } else {
                         listener.getLogger().println("Could not record history. Previous build's commit, " + lastRevWas.getSHA1().name()
@@ -1324,7 +1326,7 @@ public class GitSCM extends SCM implements Serializable {
             PrintStream out = new PrintStream(changelogFile.write(), false, "UTF-8");
             try {
                 for (Branch b : revToBuild.getBranches()) {
-                    putChangelogDiffs(git, b.getName(), remoteBranch, revToBuild.getSha1().name(), out);
+                    putChangelogDiffs(git, b.getName(), remoteBranch, revToBuild.getSha1().name(), out, 0);
                     histories++;
                 }
             } catch (GitException ge) {
@@ -1360,7 +1362,7 @@ public class GitSCM extends SCM implements Serializable {
                 env.put(GIT_COMMIT, commit);
             }
         }
-       
+
       if(userRemoteConfigs.size()==1){
     	  env.put("GIT_URL", userRemoteConfigs.get(0).getUrl());
       }else{
@@ -1368,10 +1370,10 @@ public class GitSCM extends SCM implements Serializable {
     	  for(UserRemoteConfig config:userRemoteConfigs)   {
       		env.put("GIT_URL_"+count, config.getUrl());
       		count++;
-         }  
+         }
       }
-    	  
-    	
+
+
         String confName = getGitConfigNameToUse();
         if ((confName != null) && (!confName.equals(""))) {
             env.put("GIT_COMMITTER_NAME", confName);
@@ -1399,11 +1401,39 @@ public class GitSCM extends SCM implements Serializable {
         return prevCommit;
     }
 
+    private static final Pattern SUBMODULE_CHANGE_ENTRY = Pattern.compile("^:160000 160000 ([0-9a-f]{40}) ([0-9a-f]{40}) M (?>[0-9]+)?\t(.*)$");
 
     private void putChangelogDiffs(GitClient git, String branchName, String revFrom,
-            String revTo, PrintStream fos) throws IOException {
+                                   String revTo, PrintStream fos, int recursionDepth) throws IOException {
         fos.println("Changes in branch " + branchName + ", between " + revFrom + " and " + revTo);
-        git.changelog(revFrom, revTo, fos);
+
+        if (disableSubmodules || (recursionDepth == submoduleChangesRecursionDepth)) {
+            git.changelog(revFrom, revTo, fos);
+        } else {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            git.changelog(revFrom, revTo, out);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(out.toByteArray())));
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                fos.println(line);
+                if ((line.length() > 0) && (':' == line.charAt(0))) {
+                    Matcher logMatcher = SUBMODULE_CHANGE_ENTRY.matcher(line);
+                    if (logMatcher.matches() && logMatcher.groupCount() == 3) {
+
+                        String src = logMatcher.group(1);
+                        String dst = logMatcher.group(2);
+                        String subModule = logMatcher.group(3);
+
+                        fos.println("submodule push " + subModule);
+                        GitClient subGitclient = git.subGit(subModule);
+                        putChangelogDiffs(subGitclient, branchName, src, dst, fos, recursionDepth + 1);
+                        fos.println("submodule pop " + subModule);
+
+                    }
+                }
+            }
+        }
     }
 
     @Override
@@ -1417,7 +1447,7 @@ public class GitSCM extends SCM implements Serializable {
     public String getScmName() {
         return scmName;
     }
-    
+
     @Extension
     public static final class DescriptorImpl extends SCMDescriptor<GitSCM> {
 
